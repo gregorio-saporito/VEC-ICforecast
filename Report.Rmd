@@ -1,0 +1,393 @@
+---
+title: "COVid-19 Empirical Research Webinar"
+subtitle: "Notes from the presentation \"Real time forecasting of Covid-19 intensive care units demand\" and testing of the model proposed in the Danish context"
+author: "Gregorio Luigi Saporito"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This report includes:
+
+* Notes from the presentation \"Real time forecasting of Covid-19 intensive care units demand\" held the 30th of October 2020 as part of the \"COVid-19 Empirical Research Webinar\" by the Centre of Excellence in Economics and Data Science (CEEDS). For more details on the event and the program see <https://ceeds.unimi.it/webinar-cover/>.
+* The implementation of the model suggested by Berta P., Lovaglio P. G., Paruolo P., Verzillo S. to forecast Covid-19 intensive care units demand in the Danish context.
+
+## Vector Error correction model (VECM)
+The model proposed by the authors exploits the cointegrating relationship (in the sense of Engle R. F. and Granger C. W. J. (1987)) between the time series of hospitalised patients and intensive care unit (IC) occupancy. While this approach is quite popular in the Time Series Econometrics Literature, its application in the context of forecasting IC unit demand is less established.
+
+The application of the VEC model in this context has some great potential because modelling time series in differences allows to capture just the short-term relationship between variables. The VEC model instead allows the possibility to include some aspects of the lon-run relationship if a cointegrating relationship exists. Essentially the presence of a cointegrating relationships indicates the presence of a long-run equilibrium relationship between two variables.
+
+As Berta P., Lovaglio P. G., Paruolo P., Verzillo S. suggest, the presence of such cointegrating relationship oftentimes exists between the number of hospitalised patients and the demand for intensive care beds and it can be exploited to obtain better forecasts. In other words, leveraging this relationship can turn out to be more powerful than just modelling the time series in differences.
+
+This methodology was successfull validated in regions of Italy, Spain, and Switzerland (Berta et al. (2020)). Based on this evidence, I decided to investigate if this approach can work in other contexts too. In particular, I chose to test it on Denmark.
+
+## Application in the Danish context
+The dataset was retrieved from the European Centre for Disease Prevention and Control (ECDC) (see <https://www.ecdc.europa.eu/en/publications-data/download-data-hospital-and-icu-admission-rates-and-current-occupancy-covid-19>) and it contains the daily time series of hospitalisation and Intensive Care Unit occupancy.
+
+```{r, include = FALSE}
+library(readr)
+library(devtools)
+library(tidyverse)
+library(zoo)
+library(forecast)
+
+data <- read_csv("data.csv") %>%
+  mutate(date = as.Date(date,format="%d/%m/%Y")) %>%
+  dplyr::select(-year_week,-source,-url) %>%
+  filter(indicator %in% c("Daily hospital occupancy","Daily ICU occupancy")) %>%
+  filter(country == "Denmark") %>%
+  spread(indicator,value)
+
+# check min and max dates and missing dates
+full_dates <- seq(from=min(data$date), to=max(data$date),
+    by="day")
+
+## Make a data frame with a full series of dates from the min date to the max date
+## in the incomplete data frame
+full_dates <- data.frame(date = full_dates)
+
+## Merge the complete data frame with the incomplete to fill in the dates and add 
+## NAs for missing values
+my_complete_data <- merge(full_dates, data, by = "date", 
+                          all.x = TRUE)
+
+n_NAs <- length(filter(my_complete_data,is.na(`Daily hospital occupancy`)) %>% pull())+ length(filter(my_complete_data,is.na(`Daily ICU occupancy`)) %>% pull())
+```
+
+A total of `r n_NAs` missing data points were interpolated using `auto.arima`. This is how the plot in logs of hospitalised with Covid and in intensive care looks like.
+
+```{r, include = FALSE}
+# we need to interpolate the missing  values
+# for hospitalised
+s_hosp <- ts(my_complete_data$`Daily hospital occupancy`)
+
+for(i in c(1:length(s_hosp))){
+  if(is.na(s_hosp[i])){
+    a <- ts(s_hosp[1:(i-1)])
+    b <- forecast(auto.arima(a))
+    s_hosp[i] <- round(b$mean[1])
+  }else{
+    print("skip")
+  }
+}
+  
+# for IC
+s_IC <- ts(my_complete_data$`Daily ICU occupancy`)
+
+for(i in c(1:length(s_IC))){
+  if(is.na(s_IC[i])){
+    a <- ts(s_IC[1:(i-1)])
+    b <- forecast(auto.arima(a))
+    s_IC[i] <- round(b$mean[1])
+  }else{
+    print("skip")
+  }
+}
+
+data_clean <- tibble(my_complete_data) %>%
+  mutate(fit_hosp=s_hosp,
+         fit_IC=s_IC) %>%
+  mutate(
+    `Daily hospital occupancy` = ifelse(is.na(`Daily hospital occupancy`),fit_hosp,`Daily hospital occupancy`),
+    `Daily ICU occupancy` = ifelse(is.na(`Daily ICU occupancy`),fit_IC,`Daily ICU occupancy`)
+  ) %>%
+  dplyr::select(-fit_hosp,-fit_IC) %>%
+  gather(key="indicator",value="value",-date,-country) %>%
+  # fix log issue
+  mutate(value=ifelse(value<=0,0.001,value))
+
+
+
+dates <- filter(data_clean,indicator=="Daily hospital occupancy")$date
+
+HwS <- filter(data_clean,indicator=="Daily hospital occupancy")$value
+IC <- filter(data_clean,indicator=="Daily ICU occupancy")$value
+
+HwS <- zoo(log(HwS), order.by = dates)
+IC <- zoo(log(IC), order.by = dates)
+
+# being too close to zero the logarithm still returns an extreme negative spike for a value
+# it is better to interpolate it
+IC_fix <- ts(IC)
+
+for(i in c(1:length(IC_fix))){
+  if(IC_fix[i]<0){
+    a <- ts(IC_fix[1:(i-1)])
+    b <- forecast(auto.arima(a))
+    IC_fix[i] <- round(b$mean[1])
+  }else{
+    print("skip")
+  }
+}
+
+IC <- zoo(IC_fix, order.by = dates)
+```
+
+```{r, echo=FALSE}
+par(mfrow=c(1,1))
+plot(HwS, type='l', main="HwS vs. IC", col="blue", 
+     ylim = c(0, 7)
+     )
+lines(IC, col="red")
+```
+
+As can be seen from the plot above, there appears to be a systemic long-run relationship between the two time series and it is worth investigating if a cointegrating relationship exists.
+
+## Unit Root Test
+The results below show that we can reject the null of no unit root (the test statistic has to be larger than the critical value).
+
+```{r, include=FALSE}
+library(urca)
+HwS.urers1 <- ur.ers(HwS, type="P-test")
+IC.urers2 <- ur.ers(IC, type="P-test")
+# function creating table of the unit root test
+ur_table <- function(x,y){
+  tibble(
+    `test` = paste(x@test.name, x@type),
+    variable = y,
+    `test statistic` = x@teststat,
+    `1pct` = x@cval[1],
+    `5pct` = x@cval[2],
+    `10pct` = x@cval[3]
+  )
+}
+```
+
+
+```{r, echo=FALSE}
+knitr::kable(ur_table(HwS.urers1,"HwS") %>% bind_rows(ur_table(IC.urers2,"IC")))
+```
+
+Having evidence of a unit root in levels, we now test for a unit root in differences.
+
+```{r, include=FALSE}
+dHwS <- diff(HwS)
+dIC <- diff(IC)
+
+dHwS.urers1 <- ur.ers(dHwS, type="P-test")
+dIC.urers2 <- ur.ers(dIC, type="P-test")
+```
+
+```{r, echo=FALSE}
+knitr::kable(ur_table(dHwS.urers1,"diff(HwS)") %>% bind_rows(ur_table(dIC.urers2,"diff(IC)")))
+```
+
+Based on this result, we can say that both time series are I(1).
+
+```{r, echo=FALSE}
+par(mfrow=c(1,1))
+plot(dHwS, type='l', main="(log difference)HwS vs. (log difference)IC", col="blue")
+lines(dIC, col="red")
+```
+
+```{r, include=FALSE}
+library(vars)
+y <- cbind(HwS, IC)
+colnames(y) <- c("HwS","IC")
+y <- na.trim(y)
+
+# determine number of lags to be included in cointegration test and in VEC model
+y.VAR.IC <- VARselect(y, type="const")
+nlags <- y.VAR.IC$selection["AIC(n)"]
+
+y <- window(y, start=min(dates), end=(max(dates)-7))
+```
+
+## Cointegration analysis
+
+According to the Akaike information criterion the number of lags to include in the cointegration analysis is `r nlags`. We then proceed with the cointegration test. r=0 tests for the presence of cointegration. The test statistic exceeds the significance level and we can reject the null hypothesis of no cointegration.
+
+```{r, echo = FALSE}
+library(urca)
+y.CA <- ca.jo(y, ecdet="const", type="eigen", K=nlags, spec="transitory")
+summary(y.CA)
+```
+
+```{r, include = FALSE}
+# ols test unit root of residuals
+ols <- lm(IC ~ HwS)
+
+# no unit root
+# there is a linear combination that is I(0) + previous evidence the series are cointegrated
+ur_test <- ur.ers(ols$residuals, type="P-test")
+s_urtest <- summary(ur_test)
+tstat <- s_urtest@teststat
+siglev <- s_urtest@cval[2]
+```
+
+This is essentially the same as breaking down the test into two parts
+
+* The two series are integrated of order 1 (I(1)) (as proven above)
+* Their residuals from OLS are I(0) (the test statistic `r tstat` is lower than the 5% significance level `r siglev`)
+
+These conditions are satisfied, the two series are hence cointegrated and we can exploit this long-run equilibrium by including it in our model.
+
+```{r, echo = FALSE}
+#plot(ols$residuals)
+```
+
+
+```{r, include = FALSE}
+y.VEC <- cajorls(y.CA, r=1)
+y.VEC
+library(tsDyn)
+coef <- coefA(y.VEC)
+summary(y.VEC$rlm)
+```
+
+We then estimate the unrestriced VEC model and use the restricted sample to estimate
+a bivariate VEC model. These adjustment parameters  $\alpha_1$ and $\alpha_2$ for HwS and IC are `r coef[1]` and `r coef[2]` respectively. While $\alpha_2$ is significan $\alpha_1$ is not. We therefore proceed with the restricted adjustment of the parameter $\alpha$ setting $\alpha_1$ to zero. This is essentially like saying that HwS is a pure random walk and all the adjustment occurs in IC.
+
+```{r, include = FALSE}
+# test for restricted adjustment parameters alpha
+rest.alpha <- matrix(c(0,1), c(2,1))
+# estimate the restricted VAR
+y.CA.ralpha <- alrtest(y.CA, A=rest.alpha, r=1)
+```
+
+```{r, echo=FALSE}
+summary(y.CA.ralpha)
+```
+
+```{r, include = FALSE}
+# forecast
+yall <- cbind(HwS, IC)
+colnames(yall) <- c("HwS","IC")
+yall <- na.trim(yall)
+
+yall <- window(yall, start=min(dates), end=max(dates))
+first.m <- min(dates)
+last.m <- (max(dates)-7)
+
+y.p1 <- window(yall, end=last.m)
+y.p2 <- window(yall, start=last.m+1)
+
+new <- as.character(seq(from=last.m, to=max(dates)-1, by="day"))
+
+y.VAR.f1 <-data.frame()
+y.VAR.f2 <-data.frame()
+
+for(i in new){
+  
+  y <- window(yall, end = i)
+  y.CA <- ca.jo(y, ecdet="const", type="eigen", K=nlags, spec="transitory")
+  y.VAR <- vec2var(y.CA, r=1)
+  y.VAR.updt <- predict(y.VAR, n.ahead=1)
+  y.VAR.f1 <-rbind(y.VAR.f1, as.ts(y.VAR.updt$fcst$HwS))
+  y.VAR.f2 <-rbind(y.VAR.f2, as.ts(y.VAR.updt$fcst$IC))
+  
+}
+
+old = tibble(
+  date = dates[1:(length(dates)-7)],
+  value = as.vector(y.p1[,2])
+)
+
+forecast = tibble(
+  date = dates[(length(dates)-6):length(dates)],
+  value = y.VAR.f2$fcst
+)
+
+actual = tibble(
+  date = dates[(length(dates)-6):length(dates)],
+  value = as.vector(y.p2[,2])
+)
+```
+
+
+## One week ahead forecast
+
+In red the out of sample estimates of IC occupancy.
+
+```{r, echo=FALSE,fig.align='center'}
+ggplot() +
+  geom_line(data = old,aes(x=date,y=value),col='black') +
+  geom_point(data = old,aes(x=date,y=value),col='blue') +
+  geom_line(data = actual,aes(x=date,y=value),col='black') +
+  geom_point(data=forecast,aes(x=date,y=value),col='red') +
+  theme_classic() +
+  ylab("log(IC)")
+```
+
+## Comparison with the random walk and performance
+
+```{r, include=FALSE}
+dIC.p1 <- window(dIC, end=last.m)
+dIC.p2 <- window(dIC, start=last.m+1)
+
+# apply random walk
+arma01 <- Arima(dIC.p1, order=c(0, 1, 0))
+
+# forecasts from random walk
+rol.f <- c()
+for(i in new){
+  y <- window(dIC, end = i)
+  rol.updt <- arima(y, order=c(0,1,0))
+  rol.f <- c(rol.f, forecast(rol.updt, 1)$mean)
+}
+
+dates_rw <- index(dIC)
+
+old_rw = tibble(
+  date = dates_rw[1:(length(dates_rw)-7)],
+  value = as.vector(dIC[1:(length(dates_rw)-7)])
+)
+
+forecast_rw = tibble(
+  date = dates_rw[(length(dates_rw)-6):length(dates_rw)],
+  value = rol.f[1:(length(rol.f))]
+)
+
+actual_rw = tibble(
+  date = dates_rw[(length(dates_rw)-6):length(dates_rw)],
+  value = as.vector(dIC[(length(dates_rw)-6):length(dates_rw)])
+)
+```
+
+```{r, include=FALSE}
+# look at MAE and MAPE
+# VEC model
+err_VEC <- accuracy(as.vector(y.p2[,2]), y.VAR.f2$fcst)
+err_VEC
+
+# from the random walk
+err_rw <- accuracy(as.vector(dIC[(length(dates_rw)-6):length(dates_rw)]), rol.f[1:(length(rol.f))])
+err_rw
+
+table <- data.frame(rbind(err_VEC,err_rw))
+row.names(table) <- c("VEC","Random_Walk")
+table_perf <- table[,c(3,5)]
+```
+
+The VEC model does outperform the random walk according to the MAE (mean absolute error) and MAPE (mean absolute percentage error) indices.
+
+```{r, echo=FALSE}
+knitr::kable(
+  table_perf
+)
+```
+
+$$
+MAE = (\frac{1}{n})\sum_{i=1}^{n}\left | F_{i} - A_{i} \right |;
+\;
+MAPE = (\frac{1}{n})\sum_{i=1}^{n}\left | \frac{A_{i} - F_{i}}{A_{i}} \right |
+$$
+Where $A$ indicates the actual and $F$ the forecast
+
+## Conclusion
+The VEC model did outperform the random walk, which validates the approach suggested by Berta P., Lovaglio P. G., Paruolo P., Verzillo S. in their paper. The VEC has the advatage of capturing the long-run relationship between the variables allowing for temporary deviations from the equilibrium. Furthermore, its parameters have a clear interpretation (i.e. no black box). However, the main disadvantage is its flexibility: a cointegrating relationship might not always exists and, in such circumstances, other forecasting techniques have to be used. Nonetheless, when then data generating process gives evidence of a cointegrating relationship the VEC model can be a powerful candidate to obtain robust forecasts.
+
+\newpage
+
+## References
+Berta, P., Lovaglio, P. G., Paruolo, P., & Verzillo, S. (2020). Real time forecasting of Covid-19 intensive care units demand (No. 2020-08).
+
+Berta, P., Paruolo, P., Verzillo, S., & Lovaglio, P. G. (2020). A bivariate prediction approach for adapting the health care system response to the spread of COVID-19. Plos one, 15(10), e0240150.
+
+Engle, R. F., & Granger, C. W. (1987). Co-integration and error correction: representation, estimation, and testing. Econometrica: journal of the Econometric Society, 251-276.
+
+
