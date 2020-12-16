@@ -313,3 +313,4 @@ err_VEC
 # from the random walk
 err_rw <- accuracy(as.vector(dIC[(length(dates_rw)-6):length(dates_rw)]), rol.f[1:(length(rol.f))])
 err_rw
+
